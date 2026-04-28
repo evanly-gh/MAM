@@ -1,2 +1,0 @@
-# MAM
-Multi-Agent MicroLLMs

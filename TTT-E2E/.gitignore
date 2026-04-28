@@ -1,0 +1,15 @@
+# Model checkpoints (~500 MB each — never commit)
+checkpoints/
+*.pt
+
+# Tokenized dataset cache (regenerated on demand)
+.cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Logs (regenerated each training run)
+logs/

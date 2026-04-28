@@ -1,0 +1,8 @@
+torch>=2.5
+transformers>=4.46
+tokenizers>=0.20
+datasets
+tiktoken
+higher
+tqdm
+psutil
