@@ -11,6 +11,9 @@ Design choices (cite paper sections from https://test-time-training.github.io/e2
     (paper §3.4 / "preserve pretrained knowledge"). Without it, the trainable
     MLP can drift arbitrarily far from the pretrained behavior during inner
     updates. The static path anchors it.
+
+This file was renamed from ``model.py`` to ``mam_model.py`` when the Flan-T5
+implementation was merged in alongside (see ``flan_dual_mlp_model.py``).
 """
 
 from __future__ import annotations
@@ -55,6 +58,8 @@ class TTTGPT2(nn.Module):
         super().__init__()
         # `attn_implementation="eager"` avoids torch SDPA, whose CPU flash
         # kernel has no backward-of-backward -- which the outer loop needs.
+        # On CUDA this is a no-op (eager attention works fine on GPU too),
+        # so keeping it makes the code portable across both devices.
         self.lm = GPT2LMHeadModel.from_pretrained(model_name, attn_implementation="eager")
         self.tokenizer = GPT2Tokenizer.from_pretrained(model_name)
         # GPT-2 pad-less -- set pad = eos for generate() convenience.
@@ -105,10 +110,16 @@ class TTTGPT2(nn.Module):
         so that TTT state is per-prompt, not a permanent finetune."""
         return [p.detach().clone() for p in self.inner_params()]
 
-    def restore_inner(self, snapshot: list[torch.Tensor]):
+    def restore_inner(self, snapshot: list[torch.Tensor]) -> None:
+        """Copy a snapshot back into the inner params, in-place.
+
+        The .to(device, dtype) conversion lets a snapshot taken on CPU be
+        restored onto a CUDA model and vice versa -- useful when moving
+        checkpoints between machines.
+        """
         with torch.no_grad():
             for p, s in zip(self.inner_params(), snapshot):
-                p.copy_(s)
+                p.copy_(s.to(device=p.device, dtype=p.dtype))
 
     # -- forward passthrough -------------------------------------------------
 
