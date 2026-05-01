@@ -25,7 +25,7 @@ from typing import Callable
 import torch
 import torch.nn.functional as F
 
-from .model import TTTGPT2
+from .mam_model import TTTGPT2
 
 
 @dataclass
@@ -52,7 +52,8 @@ def perplexity_under_model(generated: str, reference: str, model: TTTGPT2 = None
     `reference` is unused here -- kept in signature for interface uniformity.
     """
     assert model is not None, "perplexity_under_model needs a model"
-    ids = model.tokenizer.encode(generated, return_tensors="pt")
+    device = next(model.parameters()).device
+    ids = model.tokenizer.encode(generated, return_tensors="pt").to(device)
     if ids.size(-1) < 2:
         return float("inf")
     with torch.no_grad():

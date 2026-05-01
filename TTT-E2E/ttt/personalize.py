@@ -11,8 +11,8 @@ Pipeline:
      same style, using a pluggable scorer (see ttt/scorers.py).
   6. Reset fast weights so the next call starts fresh.
 
-The scoring step is decoupled: swap `--scorer` to use a different accuracy
-metric without touching the generation code. Add new scorers in scorers.py.
+The inner loop is single-pass; the strength of personalization scales with the
+length of the style corpus, not the number of repeats.
 
 Example:
   python -m ttt.personalize \\
@@ -20,8 +20,7 @@ Example:
       --style-file styles/alice.txt \\
       --prompt "Subject: lunch tomorrow\\n\\nHi Bob," \\
       --reference styles/alice_held_out.txt \\
-      --scorer perplexity \\
-      --inner-steps 20 --inner-lr 1e-3
+      --scorer perplexity --inner-lr 1e-3
 """
 
 from __future__ import annotations
@@ -30,8 +29,9 @@ import argparse
 
 import torch
 
-from .inner_loop import inner_adapt_inplace
-from .model import TTTGPT2
+from .mam_inner import inner_adapt_inplace
+from .mam_model import TTTGPT2
+from .mam_outer import resolve_device
 from .scorers import SCORERS, get as get_scorer
 
 
@@ -39,23 +39,23 @@ def personalize(
     model: TTTGPT2,
     style_corpus: str,
     prompt: str,
-    inner_steps: int,
+    *,
     inner_lr: float,
     window: int,
     max_new_tokens: int,
-) -> str:
+    adapt: bool,
+) -> tuple[str, str]:
     tok = model.tokenizer
-    style_ids = tok.encode(style_corpus, return_tensors="pt")
-    prompt_ids = tok.encode(prompt, return_tensors="pt")
+    device = next(model.parameters()).device
+    style_ids = tok.encode(style_corpus, return_tensors="pt").to(device)
+    prompt_ids = tok.encode(prompt, return_tensors="pt").to(device)
 
     snap = model.snapshot_inner()
     try:
-        if inner_steps > 0:
+        if adapt:
             # The TTT step IS the personalization. We are training the model
             # on this person's text, at inference time, just before generation.
-            inner_adapt_inplace(
-                model, style_ids, steps=inner_steps, lr=inner_lr, window=window
-            )
+            inner_adapt_inplace(model, style_ids, lr=inner_lr, window=window)
         with torch.no_grad():
             out = model.generate(
                 prompt_ids,
@@ -64,8 +64,7 @@ def personalize(
                 pad_token_id=tok.eos_token_id,
             )
         text = tok.decode(out[0], skip_special_tokens=True)
-        # Just return the newly generated portion (everything after the prompt).
-        gen_only = tok.decode(out[0, prompt_ids.size(-1) :], skip_special_tokens=True)
+        gen_only = tok.decode(out[0, prompt_ids.size(-1):], skip_special_tokens=True)
         return text, gen_only
     finally:
         # Reset: personalization is per-call, never sticks.
@@ -86,13 +85,19 @@ def main():
     ap.add_argument("--scorer", type=str, default=None,
                     choices=list(SCORERS),
                     help="Scoring metric. Omit to skip scoring.")
-    ap.add_argument("--inner-steps", type=int, default=20)
     ap.add_argument("--inner-lr", type=float, default=1e-3)
     ap.add_argument("--window", type=int, default=256)
     ap.add_argument("--max-new-tokens", type=int, default=120)
     ap.add_argument("--baseline", action="store_true",
-                    help="Also run with inner-steps=0 and print both, so you "
-                         "can see what TTT contributed.")
+                    help="Also run with adaptation disabled and print both, "
+                         "so you can see what TTT contributed.")
+    ap.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="auto picks cuda if available, else cpu.",
+    )
     args = ap.parse_args()
 
     if args.prompt is None and args.prompt_file is None:
@@ -101,24 +106,28 @@ def main():
     style = open(args.style_file, encoding="utf-8").read()
     reference = open(args.reference, encoding="utf-8").read() if args.reference else None
 
+    device = resolve_device(args.device)
+    print(f"[personalize] device={device}")
+
     model = TTTGPT2("gpt2")
     if args.checkpoint:
         model.load_state_dict(torch.load(args.checkpoint, map_location="cpu"))
+    model = model.to(device)
 
-    runs: list[tuple[str, int]] = []
+    runs: list[tuple[str, bool]] = []
     if args.baseline:
-        runs.append(("no-TTT  ", 0))
-    runs.append((f"TTT x{args.inner_steps}", args.inner_steps))
+        runs.append(("no-TTT  ", False))
+    runs.append(("TTT     ", True))
 
     scorer = get_scorer(args.scorer) if args.scorer else None
 
-    for label, steps in runs:
+    for label, adapt in runs:
         full, gen_only = personalize(
             model, style, prompt,
-            inner_steps=steps,
             inner_lr=args.inner_lr,
             window=args.window,
             max_new_tokens=args.max_new_tokens,
+            adapt=adapt,
         )
         print(f"\n=== {label} ===")
         print(full)
@@ -127,10 +136,9 @@ def main():
             # personalized model (e.g. perplexity).
             if scorer.name == "perplexity":
                 snap = model.snapshot_inner()
-                if steps > 0:
-                    style_ids = model.tokenizer.encode(style, return_tensors="pt")
-                    inner_adapt_inplace(model, style_ids, steps=steps,
-                                        lr=args.inner_lr, window=args.window)
+                if adapt:
+                    style_ids = model.tokenizer.encode(style, return_tensors="pt").to(device)
+                    inner_adapt_inplace(model, style_ids, lr=args.inner_lr, window=args.window)
                 s = scorer(gen_only, reference or "", model=model)
                 model.restore_inner(snap)
             else:

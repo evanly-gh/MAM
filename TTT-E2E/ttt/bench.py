@@ -2,19 +2,22 @@
 
 Subcommands (each prints a small table):
 
-  latency       per-token generation throughput, prompt-processing throughput,
-                ms/inner-step, peak RSS. The "llama-bench"-style numbers.
-  ctx-scaling   continuation perplexity vs context length (TTT-E2E paper §4:
-                does quality keep improving as context grows?).
-  steps-scaling continuation perplexity vs --inner-steps. Diminishing returns
-                + eventual overfitting expected.
-  needle        toy needle-in-a-haystack: hide a fact in long context, ask the
-                model to recall it. Paper §5: full attention beats TTT here
-                because TTT is compression, not lossless recall.
-  reset         sanity check that fast weights reset between prompts (TTT
-                state must be per-prompt, not a permanent finetune).
+  latency        per-token generation throughput, prompt-processing throughput,
+                 ms/inner-pass, peak RSS. The "llama-bench"-style numbers.
+  ctx-scaling    continuation perplexity vs context length (TTT-E2E paper §4:
+                 does quality keep improving as context grows?).
+  passes-scaling continuation perplexity vs number of full inner-loop passes
+                 over the context. The default is 1 pass (the paper's
+                 streaming inner loop). Sweeping >1 reproduces the old
+                 K-step behaviour as a degraded baseline.
+  needle         toy needle-in-a-haystack: hide a fact in long context, ask the
+                 model to recall it. Paper §5: full attention beats TTT here
+                 because TTT is compression, not lossless recall.
+  reset          sanity check that fast weights reset between prompts (TTT
+                 state must be per-prompt, not a permanent finetune).
 
 All commands take an optional --checkpoint; omit to bench raw GPT-2.
+All commands take --device {auto,cpu,cuda}; auto picks cuda if available.
 """
 
 from __future__ import annotations
@@ -27,17 +30,19 @@ import psutil
 import torch
 import torch.nn.functional as F
 
-from .inner_loop import inner_adapt_inplace
-from .model import TTTGPT2
+from .mam_inner import inner_adapt_inplace
+from .mam_model import TTTGPT2
+from .mam_outer import resolve_device
 
 
 # ---- helpers ----------------------------------------------------------------
 
 
-def _load(checkpoint: str | None) -> TTTGPT2:
+def _load(checkpoint: str | None, device: torch.device) -> TTTGPT2:
     m = TTTGPT2("gpt2")
     if checkpoint:
         m.load_state_dict(torch.load(checkpoint, map_location="cpu"))
+    m = m.to(device)
     m.eval()
     return m
 
@@ -46,10 +51,10 @@ def _peak_rss_mb() -> float:
     return psutil.Process().memory_info().rss / 1024 / 1024
 
 
-def _random_ids(model: TTTGPT2, n: int) -> torch.Tensor:
+def _random_ids(model: TTTGPT2, n: int, device: torch.device) -> torch.Tensor:
     """Random-but-valid token ids — not English, but fine for latency tests."""
     vocab = model.lm.config.vocab_size
-    return torch.randint(0, vocab, (1, n))
+    return torch.randint(0, vocab, (1, n), device=device)
 
 
 def _continuation_ppl(model: TTTGPT2, ctx: torch.Tensor, cont: torch.Tensor) -> float:
@@ -62,6 +67,17 @@ def _continuation_ppl(model: TTTGPT2, ctx: torch.Tensor, cont: torch.Tensor) -> 
     return math.exp(nll.item())
 
 
+def _run_inner_passes(model, ctx, *, passes: int, lr: float, window: int):
+    """Run `passes` full single-pass inner loops over ctx, back-to-back.
+
+    The paper's inner loop is one pass over the context. `passes > 1`
+    re-streams the same context multiple times -- the older K-step behaviour,
+    kept here as a degraded baseline you can sweep against.
+    """
+    for _ in range(max(0, passes)):
+        inner_adapt_inplace(model, ctx, lr=lr, window=window)
+
+
 # ---- subcommands ------------------------------------------------------------
 
 
@@ -70,11 +86,13 @@ def cmd_latency(args):
 
     pp (prompt processing) = forward-pass tokens/sec on a fresh long prompt.
     tg (token generation)  = autoregressive greedy decoding tokens/sec.
-    inner-step             = ms per SGD step on `--ctx-len` tokens.
+    inner-pass             = ms per single-pass inner loop on `--ctx-len` tokens.
     peak RSS               = process resident memory at end of the run.
     """
-    model = _load(args.checkpoint)
-    ctx = _random_ids(model, args.ctx_len)
+    device = resolve_device(args.device)
+    print(f"[bench latency] device={device}")
+    model = _load(args.checkpoint, device)
+    ctx = _random_ids(model, args.ctx_len, device)
 
     # Prompt-processing: time a single forward pass over `ctx_len` tokens.
     with torch.no_grad():
@@ -95,18 +113,18 @@ def cmd_latency(args):
         tg_s = time.perf_counter() - t0
     tg_tok_per_s = args.gen_tokens / tg_s
 
-    # Inner-step: time `inner_steps` SGD updates on the prompt.
+    # Inner-pass: time `passes` full single-pass adaptations on the prompt.
     snap = model.snapshot_inner()
     t0 = time.perf_counter()
-    inner_adapt_inplace(model, ctx, steps=args.inner_steps, lr=1e-3, window=args.ctx_len)
+    _run_inner_passes(model, ctx, passes=args.passes, lr=1e-3, window=args.ctx_len)
     inner_s = time.perf_counter() - t0
     model.restore_inner(snap)
-    ms_per_step = 1000 * inner_s / max(1, args.inner_steps)
+    ms_per_pass = 1000 * inner_s / max(1, args.passes)
 
     print(f"\nLatency @ ctx_len={args.ctx_len}, gen={args.gen_tokens} tokens")
     print(f"  prompt processing : {pp_tok_per_s:8.1f} tok/s   ({pp_s*1000:7.1f} ms total)")
     print(f"  token generation  : {tg_tok_per_s:8.1f} tok/s   ({tg_s:7.2f} s total)")
-    print(f"  inner-loop step   : {ms_per_step:8.1f} ms/step  ({args.inner_steps} steps)")
+    print(f"  inner-loop pass   : {ms_per_pass:8.1f} ms/pass  ({args.passes} passes)")
     print(f"  peak RSS          : {_peak_rss_mb():8.0f} MB")
 
 
@@ -117,10 +135,12 @@ def cmd_ctx_scaling(args):
     full attention; pure RNNs plateau. At GPT-2 scale we can only sweep up to
     1024 tokens (model max), which is small but the trend should be visible.
     """
-    model = _load(args.checkpoint)
+    device = resolve_device(args.device)
+    print(f"[bench ctx-scaling] device={device}")
+    model = _load(args.checkpoint, device)
     tok = model.tokenizer
     with open(args.prompt_file, "r", encoding="utf-8") as f:
-        ids = tok.encode(f.read(), return_tensors="pt")
+        ids = tok.encode(f.read(), return_tensors="pt").to(device)
 
     cont_len = args.continuation_len
     print(f"\nContinuation ppl vs context length (lower is better, cont_len={cont_len})")
@@ -136,7 +156,7 @@ def cmd_ctx_scaling(args):
 
         snap = model.snapshot_inner()
         t0 = time.perf_counter()
-        inner_adapt_inplace(model, ctx, steps=args.inner_steps, lr=args.inner_lr, window=min(ctx_len, 512))
+        _run_inner_passes(model, ctx, passes=args.passes, lr=args.inner_lr, window=min(ctx_len, 512))
         inner_ms = (time.perf_counter() - t0) * 1000
         with_ttt = _continuation_ppl(model, ctx, cont)
         model.restore_inner(snap)
@@ -144,26 +164,32 @@ def cmd_ctx_scaling(args):
         print(f"  {ctx_len:>8}  {no_ttt:>12.3f}  {with_ttt:>14.3f}  {inner_ms:>10.0f}")
 
 
-def cmd_steps_scaling(args):
-    """Continuation ppl as a function of inner-step count."""
-    model = _load(args.checkpoint)
+def cmd_passes_scaling(args):
+    """Continuation ppl as a function of inner-loop pass count.
+
+    The paper's inner loop is one pass. This sweep exists to show the
+    degradation (or marginal improvement, depending on lr) of repeated
+    passes -- the old K-step regime, on demand.
+    """
+    device = resolve_device(args.device)
+    print(f"[bench passes-scaling] device={device}")
+    model = _load(args.checkpoint, device)
     tok = model.tokenizer
     with open(args.prompt_file, "r", encoding="utf-8") as f:
-        ids = tok.encode(f.read(), return_tensors="pt")
+        ids = tok.encode(f.read(), return_tensors="pt").to(device)
     ctx = ids[:, : args.ctx_len]
     cont = ids[:, args.ctx_len : args.ctx_len + args.continuation_len]
 
-    print(f"\nContinuation ppl vs --inner-steps (ctx={args.ctx_len}, lr={args.inner_lr})")
-    print(f"  {'steps':>6}  {'ppl':>10}  {'cum_ms':>8}")
-    for s in args.steps_list:
+    print(f"\nContinuation ppl vs --passes (ctx={args.ctx_len}, lr={args.inner_lr})")
+    print(f"  {'passes':>7}  {'ppl':>10}  {'cum_ms':>8}")
+    for p in args.passes_list:
         snap = model.snapshot_inner()
         t0 = time.perf_counter()
-        if s > 0:
-            inner_adapt_inplace(model, ctx, steps=s, lr=args.inner_lr, window=min(args.ctx_len, 512))
+        _run_inner_passes(model, ctx, passes=p, lr=args.inner_lr, window=min(args.ctx_len, 512))
         ms = (time.perf_counter() - t0) * 1000
         ppl = _continuation_ppl(model, ctx, cont)
         model.restore_inner(snap)
-        print(f"  {s:>6}  {ppl:>10.3f}  {ms:>8.0f}")
+        print(f"  {p:>7}  {ppl:>10.3f}  {ms:>8.0f}")
 
 
 def cmd_needle(args):
@@ -178,7 +204,9 @@ def cmd_needle(args):
     its memory is *compressive* — fine details are lost. Our toy version
     should reproduce the failure mode.
     """
-    model = _load(args.checkpoint)
+    device = resolve_device(args.device)
+    print(f"[bench needle] device={device}")
+    model = _load(args.checkpoint, device)
     tok = model.tokenizer
 
     with open(args.prompt_file, "r", encoding="utf-8") as f:
@@ -196,12 +224,12 @@ def cmd_needle(args):
     haystack = filler_ids[: args.haystack_len]
     insert_at = args.haystack_len // 4  # near beginning
     haystack = haystack[:insert_at] + needle_ids + haystack[insert_at:]
-    full = torch.tensor([haystack + query_ids], dtype=torch.long)
+    full = torch.tensor([haystack + query_ids], dtype=torch.long, device=device)
 
     snap = model.snapshot_inner()
-    if args.inner_steps > 0:
+    if args.passes > 0:
         ctx = full[:, : full.size(-1) - len(query_ids)]
-        inner_adapt_inplace(model, ctx, steps=args.inner_steps, lr=args.inner_lr, window=512)
+        _run_inner_passes(model, ctx, passes=args.passes, lr=args.inner_lr, window=512)
 
     with torch.no_grad():
         out = model.generate(
@@ -215,7 +243,7 @@ def cmd_needle(args):
     generated = out[0, -len(answer_ids) :].tolist()
     expected = answer_ids
     correct = generated == expected
-    print(f"\nNeedle-in-a-haystack @ haystack_len={args.haystack_len}, inner_steps={args.inner_steps}")
+    print(f"\nNeedle-in-a-haystack @ haystack_len={args.haystack_len}, passes={args.passes}")
     print(f"  expected : {tok.decode(expected)!r}")
     print(f"  got      : {tok.decode(generated)!r}")
     print(f"  recovered: {correct}")
@@ -223,13 +251,15 @@ def cmd_needle(args):
 
 def cmd_reset(args):
     """Confirm fast weights reset between prompts."""
-    model = _load(args.checkpoint)
+    device = resolve_device(args.device)
+    print(f"[bench reset] device={device}")
+    model = _load(args.checkpoint, device)
     tok = model.tokenizer
 
     p1 = "The chemistry of organic synthesis"
     p2 = "Lord of the Rings begins with"
-    ids1 = tok.encode(p1, return_tensors="pt")
-    ids2 = tok.encode(p2, return_tensors="pt")
+    ids1 = tok.encode(p1, return_tensors="pt").to(device)
+    ids2 = tok.encode(p2, return_tensors="pt").to(device)
 
     def gen():
         with torch.no_grad():
@@ -240,7 +270,7 @@ def cmd_reset(args):
     base = gen()  # baseline output for prompt 2
     # Now adapt on prompt 1, then reset, then generate prompt 2 again.
     snap = model.snapshot_inner()
-    inner_adapt_inplace(model, ids1, steps=10, lr=1e-3, window=512)
+    _run_inner_passes(model, ids1, passes=10, lr=1e-3, window=512)
     model.restore_inner(snap)
     after = gen()
 
@@ -256,34 +286,41 @@ def cmd_reset(args):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", type=str, default=None)
+    ap.add_argument(
+        "--device",
+        type=str,
+        default="auto",
+        choices=["auto", "cpu", "cuda"],
+        help="auto picks cuda if available, else cpu.",
+    )
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     a = sub.add_parser("latency")
     a.add_argument("--ctx-len", type=int, default=512)
     a.add_argument("--gen-tokens", type=int, default=50)
-    a.add_argument("--inner-steps", type=int, default=5)
+    a.add_argument("--passes", type=int, default=1)
     a.set_defaults(func=cmd_latency)
 
     a = sub.add_parser("ctx-scaling")
     a.add_argument("--prompt-file", type=str, required=True)
     a.add_argument("--ctx-lens", type=int, nargs="+", default=[64, 128, 256, 512, 1024])
     a.add_argument("--continuation-len", type=int, default=64)
-    a.add_argument("--inner-steps", type=int, default=5)
+    a.add_argument("--passes", type=int, default=1)
     a.add_argument("--inner-lr", type=float, default=1e-3)
     a.set_defaults(func=cmd_ctx_scaling)
 
-    a = sub.add_parser("steps-scaling")
+    a = sub.add_parser("passes-scaling")
     a.add_argument("--prompt-file", type=str, required=True)
     a.add_argument("--ctx-len", type=int, default=512)
     a.add_argument("--continuation-len", type=int, default=64)
-    a.add_argument("--steps-list", type=int, nargs="+", default=[0, 1, 2, 5, 10, 20])
+    a.add_argument("--passes-list", type=int, nargs="+", default=[0, 1, 2, 5, 10])
     a.add_argument("--inner-lr", type=float, default=1e-3)
-    a.set_defaults(func=cmd_steps_scaling)
+    a.set_defaults(func=cmd_passes_scaling)
 
     a = sub.add_parser("needle")
     a.add_argument("--prompt-file", type=str, required=True)
     a.add_argument("--haystack-len", type=int, default=512)
-    a.add_argument("--inner-steps", type=int, default=5)
+    a.add_argument("--passes", type=int, default=1)
     a.add_argument("--inner-lr", type=float, default=1e-3)
     a.set_defaults(func=cmd_needle)
 
