@@ -1,11 +1,26 @@
 """Inner loop: the actual "test-time training" step.
 
-At inference, we take K gradient steps on the next-token CE loss of the given
-context, updating ONLY the inner params (trainable MLPs in late blocks).
+At inference, we make ONE left-to-right streaming pass over the context,
+taking ONE SGD step per sliding window. The inner loop has no `steps`
+parameter -- if you want more updates, use a longer context (more windows)
+rather than re-reading the same windows.
+
+This single-pass semantics matches the TTT-E2E paper (Sun et al.,
+arXiv:2512.23675) more faithfully than the older K-step version: the
+paper's picture is "the model streams the prompt once, updating as it
+goes," not "fine-tune on the prompt as if it were a tiny dataset."
+
+Why this matters:
+  * The earlier K-step version meant the FIRST window got K updates before
+    the LAST window was ever seen. That breaks the streaming narrative and
+    biases adaptation toward early-context tokens.
+  * For meta-training with `higher`, more inner steps = a deeper
+    differentiable graph = more memory + noisier second-order gradients.
+    Single-pass keeps the graph small and the meta-signal cleaner.
 
 Two entry points:
   * `inner_adapt_inplace(model, ...)` -- modifies `model` in place with plain
-    SGD. Used at inference time (generate.py). Cheap, single-order gradients.
+    SGD. Used at inference time (generate.py / compare.py / bench.py).
   * `inner_adapt_functional(fmodel, diffopt, ...)` -- takes a functional model
     view from `higher.innerloop_ctx` and a differentiable optimizer, so the
     outer loop can backprop THROUGH the inner updates (paper: "end-to-end" in
@@ -48,17 +63,18 @@ def _iter_windows(ids: torch.Tensor, window: int, stride: int):
 def inner_adapt_inplace(
     model,
     context_ids: torch.Tensor,
-    steps: int = 1,
     lr: float = 1e-3,
     window: int = 256,
     stride: int | None = None,
 ):
     """Adapt `model`'s inner params on `context_ids` via plain SGD, in place.
 
-    This is what the paper calls the inner loop at test time. It is a real
-    training step -- forward, loss, backward, parameter update -- but it
-    happens AT INFERENCE, on the prompt the user just handed us. No labels
-    exist; the "labels" are the next tokens of the prompt itself.
+    One left-to-right pass: one SGD step per sliding window over the context.
+    No labels exist; the "labels" are the next tokens of the prompt itself.
+
+    This is what runs at inference time. It mutates the model's inner params
+    in place; pair it with `model.snapshot_inner()` / `model.restore_inner()`
+    if you want per-prompt state that resets between calls.
     """
     if stride is None:
         stride = window  # non-overlapping windows -- cheapest
@@ -66,15 +82,14 @@ def inner_adapt_inplace(
     opt = torch.optim.SGD(inner_params, lr=lr)
 
     model.train()  # enable dropout? GPT-2 default dropout is 0.1; acceptable.
-    for _ in range(steps):
-        for window_ids in _iter_windows(context_ids, window, stride):
-            if window_ids.size(-1) < 2:
-                continue
-            opt.zero_grad()
-            out = model(window_ids)
-            loss = _ce_next_token(out.logits, window_ids)
-            loss.backward()
-            opt.step()
+    for window_ids in _iter_windows(context_ids, window, stride):
+        if window_ids.size(-1) < 2:
+            continue
+        opt.zero_grad()
+        out = model(window_ids)
+        loss = _ce_next_token(out.logits, window_ids)
+        loss.backward()
+        opt.step()
     model.eval()
     return model
 
@@ -83,12 +98,12 @@ def inner_adapt_functional(
     fmodel,
     diffopt,
     context_ids: torch.Tensor,
-    steps: int = 1,
     window: int = 256,
     stride: int | None = None,
 ):
     """Inner loop using `higher`'s differentiable optimizer.
 
+    Same single-pass semantics as `inner_adapt_inplace`, but each
     `diffopt.step(loss)` records the parameter update in the autograd graph,
     so when the outer loop later calls `.backward()` on the meta-loss, the
     gradient flows:
@@ -102,11 +117,10 @@ def inner_adapt_functional(
     """
     if stride is None:
         stride = window
-    for _ in range(steps):
-        for window_ids in _iter_windows(context_ids, window, stride):
-            if window_ids.size(-1) < 2:
-                continue
-            out = fmodel(window_ids)
-            loss = _ce_next_token(out.logits, window_ids)
-            diffopt.step(loss)
+    for window_ids in _iter_windows(context_ids, window, stride):
+        if window_ids.size(-1) < 2:
+            continue
+        out = fmodel(window_ids)
+        loss = _ce_next_token(out.logits, window_ids)
+        diffopt.step(loss)
     return fmodel
