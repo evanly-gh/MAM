@@ -58,7 +58,10 @@ def _clean_emotion(s: str) -> str:
 
 STYLES = ("conversational", "poetic", "formal", "narrative")
 
-
+# profile_size — how big each example's profile is (default 30)
+# test_per_persona — held-out rows per (emotion, style) pair (default 10)
+# min_persona_size — drop tiny personas (default 50)
+# coarse_only — collapse to 6×4=24 personas with bigger profiles, vs 84 fine-grained
 @dataclass
 class ElsaConfig:
     profile_size: int = 30
